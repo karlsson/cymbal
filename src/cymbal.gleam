@@ -31,8 +31,12 @@ pub fn decode(value: String) -> Result(Yaml, String) {
 fn remove_esc_nl_esc(value: String, acc: String) -> String {
   case value {
     "\\\n" <> rest -> {
-      let rest = string.crop(rest, "\\") |> string.drop_start(1)
-      remove_esc_nl_esc(rest, acc)
+      let rest = string.trim_start(rest)
+      let rest2 = case string.first(rest) {
+        Ok("\\") -> string.drop_start(rest, 1)
+        _ -> rest
+      }
+      remove_esc_nl_esc(rest2, acc)
     }
     "" -> acc
     _ ->
@@ -581,18 +585,14 @@ fn parse_block_scalar(
         Keep -> {
           let #(line_as_string, new_tokens) =
             tokens_to_string_until_newline(tokens, "", indent)
-          let line_as_string = case string.ends_with(line_as_string, "\\\n") {
-            True -> string.drop_end(line_as_string, 2) |> string.append("\\n")
-            False -> line_as_string
-          }
           parse_block_scalar(
             new_tokens,
             value
-              <> line_as_string
-              <> case line_as_string {
+              <> case value {
               "" -> ""
               _ -> "\\n"
-            },
+            }
+              <> line_as_string,
             indent,
             block_type,
           )
