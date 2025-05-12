@@ -20,9 +20,27 @@ pub fn encode_without_document_start(doc: Yaml) -> String {
 /// Convert a string into a YAML document.
 ///
 pub fn decode(value: String) -> Result(Yaml, String) {
-  string.split(value, "\n")
+  value
+  |> remove_esc_nl_esc("")
+  |> string.split("\n")
   |> tokenize_lines
   |> parse_tokens
+}
+
+/// Escape (remove) \\\n....\ sequences
+fn remove_esc_nl_esc(value: String, acc: String) -> String {
+  case value {
+    "\\\n" <> rest -> {
+      let rest = string.crop(rest, "\\") |> string.drop_start(1)
+      remove_esc_nl_esc(rest, acc)
+    }
+    "" -> acc
+    _ ->
+      remove_esc_nl_esc(
+        string.drop_start(value, 1),
+        acc <> result.unwrap(string.first(value), ""),
+      )
+  }
 }
 
 import gleam/float
@@ -39,6 +57,8 @@ pub type Token {
   Indent(Int)
   Pipe
   RightArrow
+  CMappingStart
+  CMappingEnd
 }
 
 pub fn en(acc: String, in: Int, doc: Yaml) -> String {
@@ -328,21 +348,17 @@ fn count_leading_spaces(line: String) -> Int {
 }
 
 fn get_tokenized_value_or_block_scalar_indicator(stripped: String) {
-  case
+  let last_char_or_value =
     string.split(stripped, ": ")
     |> list.rest
     |> result.unwrap([])
     |> string.join(": ")
-  {
+
+  case last_char_or_value {
     ">" -> RightArrow
     "|" -> Pipe
-    _ ->
-      Value(
-        string.split(stripped, ": ")
-        |> list.rest
-        |> result.unwrap([])
-        |> string.join(": "),
-      )
+    "{" -> CMappingStart
+    _ -> Value(last_char_or_value)
   }
 }
 
@@ -356,14 +372,14 @@ fn tokenize_sequence_item(stripped: String, indent: Int) {
     True -> [
       Indent(indent),
       Dash,
-      Value(string.drop_left(stripped, 2)),
+      Value(string.drop_start(stripped, 2)),
       Colon,
       Newline,
     ]
     False -> [
       Indent(indent),
       Dash,
-      Value(string.drop_left(stripped, 2)),
+      Value(string.drop_start(stripped, 2)),
       Newline,
     ]
   }
@@ -376,7 +392,7 @@ fn tokenize_sequence_item(stripped: String, indent: Int) {
         string.split(stripped, ": ")
         |> list.first
         |> result.unwrap("")
-        |> string.drop_left(2),
+        |> string.drop_start(2),
       ),
       Colon,
       get_tokenized_value_or_block_scalar_indicator(stripped),
@@ -405,8 +421,8 @@ fn tokenize_key_value_pair(stripped: String, indent: Int) {
       Newline,
     ]
     False ->
-      case string.contains(stripped, ":") {
-        True -> [
+      case string.last(stripped) {
+        Ok(":") -> [
           Indent(indent),
           Key(
             string.split(stripped, ":")
@@ -416,7 +432,8 @@ fn tokenize_key_value_pair(stripped: String, indent: Int) {
           Colon,
           Newline,
         ]
-        False -> [Indent(indent), Value(stripped), Newline]
+        Ok("}") -> [Indent(indent), CMappingEnd, Newline]
+        _ -> [Indent(indent), Value(stripped), Newline]
       }
   }
 }
@@ -428,7 +445,8 @@ pub fn parse_tokens(tokens: List(Token)) -> Result(Yaml, String) {
   }
 
   case result {
-    Ok(#(yaml, _)) -> Ok(yaml)
+    Ok(#(yaml, [])) -> Ok(yaml)
+    Ok(#(_yaml, _rest)) -> Error("Not fully parsed")
     Error(error) -> Error(error)
   }
 }
@@ -458,22 +476,21 @@ fn parse_block_items(
       parse_block_items(
         rest,
         indent,
-        list.append(items, [#(key, parse_value(value))]),
+        list.append(items, [#(string.replace(key, "'", ""), parse_value(value))]),
       )
 
     [Indent(current_indent), Key(key), Colon, Newline, ..rest]
       if current_indent == indent
-    -> {
+    ->
       case parse_block(rest, indent + 1) {
         Ok(#(nested_block, remaining_tokens)) ->
           parse_block_items(
             remaining_tokens,
             indent,
-            list.append(items, [#(key, nested_block)]),
+            list.append(items, [#(string.replace(key, "'", ""), nested_block)]),
           )
         Error(error) -> Error(error)
       }
-    }
 
     // TODO: Make the following two cases into one as only the Fold/Keep changes
     [Indent(current_indent), Key(key), Colon, RightArrow, Newline, ..rest]
@@ -501,6 +518,23 @@ fn parse_block_items(
         list.append(items, [#(key, parse_value(multiline_string))]),
       )
     }
+
+    [Indent(current_indent), Key(key), Colon, CMappingStart, Newline, ..rest]
+      if current_indent == indent
+    -> {
+      case parse_block(rest, indent + 1) {
+        Ok(#(nested_block, remaining_tokens)) ->
+          parse_block_items(
+            remaining_tokens,
+            indent,
+            list.append(items, [#(key, nested_block)]),
+          )
+        Error(error) -> Error(error)
+      }
+    }
+    [Indent(current_indent), CMappingEnd, Newline, ..rest]
+      if current_indent == indent
+    -> parse_block_items(rest, indent, items)
 
     [Indent(current_indent), Dash, Value(_), Newline, ..]
       if current_indent == indent
@@ -547,14 +581,18 @@ fn parse_block_scalar(
         Keep -> {
           let #(line_as_string, new_tokens) =
             tokens_to_string_until_newline(tokens, "", indent)
+          let line_as_string = case string.ends_with(line_as_string, "\\\n") {
+            True -> string.drop_end(line_as_string, 2) |> string.append("\\n")
+            False -> line_as_string
+          }
           parse_block_scalar(
             new_tokens,
             value
-              <> case value {
+              <> line_as_string
+              <> case line_as_string {
               "" -> ""
-              _ -> "\n"
-            }
-              <> line_as_string,
+              _ -> "\\n"
+            },
             indent,
             block_type,
           )
@@ -581,7 +619,7 @@ fn tokens_to_string_until_newline(
     [Dash, ..rest] ->
       tokens_to_string_until_newline(rest, current_value <> "-", indent)
     [Colon, Newline, ..rest] ->
-      tokens_to_string_until_newline(rest, current_value <> ":\n", indent)
+      tokens_to_string_until_newline(rest, current_value <> ":\\n", indent)
     [Colon, ..rest] ->
       tokens_to_string_until_newline(rest, current_value <> ": ", indent)
     [Key(key), ..rest] ->
@@ -594,6 +632,11 @@ fn tokens_to_string_until_newline(
       tokens_to_string_until_newline(rest, current_value <> "| ", indent)
     [RightArrow, ..rest] ->
       tokens_to_string_until_newline(rest, current_value <> ">", indent)
+    [CMappingStart, ..rest] ->
+      tokens_to_string_until_newline(rest, current_value <> "{", indent)
+    [CMappingEnd, ..rest] ->
+      tokens_to_string_until_newline(rest, current_value <> "}", indent)
+
     [Newline, ..rest] -> #(current_value, rest)
     [] -> #(current_value, tokens)
   }
@@ -679,7 +722,7 @@ fn parse_int(value: String) {
 
 fn parse_octal(value: String) {
   case
-    octal_to_decimal(string.drop_left(value, 2)),
+    octal_to_decimal(string.drop_start(value, 2)),
     string.starts_with(value, "0o")
   {
     Ok(decimal), True -> int(decimal)
@@ -689,7 +732,7 @@ fn parse_octal(value: String) {
 
 fn parse_hexadecimal(value: String) {
   case
-    hex_to_decimal(string.drop_left(value, 2)),
+    hex_to_decimal(string.drop_start(value, 2)),
     string.starts_with(value, "0x")
   {
     Ok(decimal), True -> int(decimal)
